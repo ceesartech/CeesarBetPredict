@@ -1,0 +1,277 @@
+version: "3.9"
+
+name: betx
+services:
+  postgres:
+    image: postgres:16
+    container_name: betx-postgres
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-betx}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-betx}
+      POSTGRES_DB: ${POSTGRES_DB:-betx}
+    ports: ["5432:5432"]
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-betx} -d ${POSTGRES_DB:-betx}"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+      - ./db/migrations:/docker-entrypoint-initdb.d/migrations:ro
+    networks: [betx]
+
+  localstack:
+    image: localstack/localstack:2.3
+    container_name: betx-localstack
+    environment:
+      SERVICES: sqs,secretsmanager,s3
+      DEBUG: "0"
+      AWS_DEFAULT_REGION: ${AWS_DEFAULT_REGION:-us-east-1}
+      DOCKER_HOST: unix:///var/run/docker.sock
+    ports: ["4566:4566"]
+    healthcheck:
+      test: ["CMD-SHELL", "curl -sf http://localhost:4566/_localstack/health | grep '\"initialized\": true'"]
+      interval: 5s
+      timeout: 5s
+      retries: 30
+    volumes:
+      - "localstack_data:/var/lib/localstack"
+      - "/var/run/docker.sock:/var/run/docker.sock"
+    networks: [betx]
+
+  sqs-setup:
+    image: localstack/awscli-local
+    container_name: betx-sqs-setup
+    depends_on:
+      localstack:
+        condition: service_healthy
+    environment:
+      AWS_ACCESS_KEY_ID: ${AWS_ACCESS_KEY_ID:-test}
+      AWS_SECRET_ACCESS_KEY: ${AWS_SECRET_ACCESS_KEY:-test}
+      AWS_DEFAULT_REGION: ${AWS_DEFAULT_REGION:-us-east-1}
+      LOCALSTACK_HOST: localstack
+    entrypoint: >
+      sh -c "awslocal sqs create-queue --queue-name betx-orders || true"
+    networks: [betx]
+
+  migrate:
+    image: migrate/migrate:v4.16.2
+    container_name: betx-migrate
+    depends_on:
+      postgres:
+        condition: service_healthy
+    command: [
+      "-path", "/migrations",
+      "-database", "postgres://${POSTGRES_USER:-betx}:${POSTGRES_PASSWORD:-betx}@postgres:5432/${POSTGRES_DB:-betx}?sslmode=disable",
+      "up"
+    ]
+    volumes:
+      - ./db/migrations:/migrations:ro
+    restart: "no"
+    networks: [betx]
+
+  predictor:
+    build: ./services/predictor
+    container_name: betx-predictor
+    environment:
+      AWS_REGION: ${AWS_REGION}
+      MODEL_S3_URI: ${MODEL_S3_URI}
+    volumes:
+      - ./models/ensemble:/models/ensemble:ro
+    ports: ["8081:8081"]
+    depends_on:
+      postgres:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://localhost:8081/healthz"]
+      interval: 10s
+      timeout: 3s
+      retries: 12
+    networks: [betx]
+
+  orchestrator:
+    build: ./services/orchestrator
+    container_name: betx-orchestrator
+    environment:
+      POSTGRES_HOST: postgres
+      POSTGRES_PORT: 5432
+      POSTGRES_USER: ${POSTGRES_USER:-betx}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-betx}
+      POSTGRES_DB: ${POSTGRES_DB:-betx}
+      PREDICTOR_URL: ${PREDICTOR_URL:-http://predictor:8081}
+      AUTH_URL: ${AUTH_URL:-http://auth:8085}
+      SQS_QUEUE_URL: ${SQS_QUEUE_URL:-http://localstack:4566/000000000000/betx-orders}
+      AWS_ACCESS_KEY_ID: ${AWS_ACCESS_KEY_ID:-test}
+      AWS_SECRET_ACCESS_KEY: ${AWS_SECRET_ACCESS_KEY:-test}
+      AWS_DEFAULT_REGION: ${AWS_DEFAULT_REGION:-us-east-1}
+      DEP_CORRECTION: ${DEP_CORRECTION:-0.10}
+      ORCH_FEE_PROMO_CODE: ${ORCH_FEE_PROMO_CODE:-ADMIN-FREE-999}
+      STRIPE_SECRET_KEY: ${STRIPE_SECRET_KEY}
+      STRIPE_WEBHOOK_SECRET: ${STRIPE_WEBHOOK_SECRET}
+    ports: ["8083:8083"]
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+      predictor:
+        condition: service_healthy
+      sqs-setup:
+        condition: service_completed_successfully
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://localhost:8083/healthz"]
+      interval: 10s
+      timeout: 3s
+      retries: 12
+    networks: [betx]
+
+  auth:
+    build: ./services/auth
+    container_name: betx-auth
+    environment:
+      POSTGRES_HOST: postgres
+      POSTGRES_PORT: 5432
+      POSTGRES_USER: ${POSTGRES_USER:-betx}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-betx}
+      POSTGRES_DB: ${POSTGRES_DB:-betx}
+      JWT_SECRET: ${JWT_SECRET}
+      JWT_AUD: ${JWT_AUD:-betx}
+      JWT_ISS: ${JWT_ISS:-betx-auth}
+      ADMIN_EMAIL: ${ADMIN_EMAIL}
+      ADMIN_PROMO_CODE: ${ADMIN_PROMO_CODE}
+    ports: ["8085:8085"]
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://localhost:8085/healthz"]
+      interval: 10s
+      timeout: 3s
+      retries: 12
+    networks: [betx]
+
+  webapp:
+    build: ./webapp
+    container_name: betx-web
+    environment:
+      NEXT_PUBLIC_ORCH_URL: ${NEXT_PUBLIC_ORCH_URL:-http://orchestrator:8083}
+      NEXT_PUBLIC_AUTH_URL: ${NEXT_PUBLIC_AUTH_URL:-http://auth:8085}
+      NEXT_PUBLIC_CURRENCY: ${NEXT_PUBLIC_CURRENCY:-USD}
+      STRIPE_PUBLISHABLE_KEY: ${NEXT_PUBLIC_STRIPE_PUBLISHABLE_KEY}
+    ports: ["3000:3000"]
+    depends_on:
+      orchestrator:
+        condition: service_healthy
+      auth:
+        condition: service_healthy
+    networks: [betx]
+
+  mapping_admin:
+    build: ./services/mapping_admin
+    container_name: betx-map-admin
+    environment:
+      POSTGRES_HOST: postgres
+      POSTGRES_PORT: 5432
+      POSTGRES_USER: ${POSTGRES_USER:-betx}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-betx}
+      POSTGRES_DB: ${POSTGRES_DB:-betx}
+      ADMIN_TOKEN: dev-admin-token
+    ports: ["8084:8084"]
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+    networks: [betx]
+
+  connector_betfair:
+    build: ./services/connector_betfair
+    container_name: betx-conn-betfair
+    environment:
+      BETFAIR_APP_KEY: ${BETFAIR_APP_KEY}
+      BETFAIR_SESSION_TOKEN: ${BETFAIR_SESSION_TOKEN}
+      PORT: 8089
+    expose: ["8089"]
+    networks: [betx]
+
+  connector_matchbook:
+    build: ./services/connector_matchbook
+    container_name: betx-conn-matchbook
+    environment:
+      MATCHBOOK_TOKEN: ${MATCHBOOK_TOKEN}
+      PORT: 8090
+    expose: ["8090"]
+    networks: [betx]
+
+  connector_smarkets:
+    build: ./services/connector_smarkets
+    container_name: betx-conn-smarkets
+    environment:
+      SMARKETS_USERNAME: ${SMARKETS_USERNAME}
+      SMARKETS_PASSWORD: ${SMARKETS_PASSWORD}
+      PORT: 8091
+    expose: ["8091"]
+    networks: [betx]
+
+  connector_betdaq:
+    build: ./services/connector_betdaq
+    container_name: betx-conn-betdaq
+    environment:
+      BETDAQ_API_KEY: ${BETDAQ_API_KEY}
+      BETDAQ_USERNAME: ${BETDAQ_USERNAME}
+      BETDAQ_PASSWORD: ${BETDAQ_PASSWORD}
+      PORT: 8092
+    expose: ["8092"]
+    networks: [betx]
+
+  placer:
+    build: ./services/placer
+    container_name: betx-placer
+    environment:
+      POSTGRES_HOST: postgres
+      POSTGRES_PORT: 5432
+      POSTGRES_USER: ${POSTGRES_USER:-betx}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-betx}
+      POSTGRES_DB: ${POSTGRES_DB:-betx}
+      SQS_QUEUE_URL: ${SQS_QUEUE_URL:-http://localstack:4566/000000000000/betx-orders}
+      AWS_ACCESS_KEY_ID: ${AWS_ACCESS_KEY_ID:-test}
+      AWS_SECRET_ACCESS_KEY: ${AWS_SECRET_ACCESS_KEY:-test}
+      AWS_DEFAULT_REGION: ${AWS_DEFAULT_REGION:-us-east-1}
+      BETFAIR_CONNECTOR_URL: http://connector_betfair:8089
+      MATCHBOOK_CONNECTOR_URL: http://connector_matchbook:8090
+      SMARKETS_CONNECTOR_URL: http://connector_smarkets:8091
+      BETDAQ_CONNECTOR_URL: http://connector_betdaq:8092
+    depends_on:
+      orchestrator:
+        condition: service_healthy
+      connector_betfair:
+        condition: service_started
+      connector_matchbook:
+        condition: service_started
+      connector_smarkets:
+        condition: service_started
+      connector_betdaq:
+        condition: service_started
+    networks: [betx]
+
+  recon:
+    build: ./services/recon
+    container_name: betx-recon
+    environment:
+      POSTGRES_HOST: postgres
+      POSTGRES_PORT: 5432
+      POSTGRES_USER: ${POSTGRES_USER:-betx}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-betx}
+      POSTGRES_DB: ${POSTGRES_DB:-betx}
+      BETFAIR_CONNECTOR_URL: http://connector_betfair:8089
+      MATCHBOOK_CONNECTOR_URL: http://connector_matchbook:8090
+      SMARKETS_CONNECTOR_URL: http://connector_smarkets:8091
+      BETDAQ_CONNECTOR_URL: http://connector_betdaq:8092
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+    networks: [betx]
+
+volumes:
+  pgdata:
+  localstack_data:
+
+networks:
+  betx:
+    driver: bridge
